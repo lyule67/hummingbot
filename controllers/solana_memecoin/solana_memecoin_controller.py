@@ -17,13 +17,21 @@ from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
 # Import for trade execution publishing
 try:
-    from src.utils.trade_execution_publisher import create_trade_execution_publisher
+    # Try to import compressed version first
+    from src.utils.compressed_trade_publisher import create_compressed_trade_execution_publisher
+    COMPRESSED_PUBLISHER_AVAILABLE = True
     TRADE_PUBLISHER_AVAILABLE = True
 except ImportError:
-    TRADE_PUBLISHER_AVAILABLE = False
-    logging.getLogger(__name__).warning(
-        "Trade execution publisher not available. Trade executions will not be logged to external systems."
-    )
+    COMPRESSED_PUBLISHER_AVAILABLE = False
+    # Fall back to non-compressed version
+    try:
+        from src.utils.trade_execution_publisher import create_trade_execution_publisher
+        TRADE_PUBLISHER_AVAILABLE = True
+    except ImportError:
+        TRADE_PUBLISHER_AVAILABLE = False
+        logging.getLogger(__name__).warning(
+            "Trade execution publisher not available. Trade executions will not be logged to external systems."
+        )
 
 
 class SolanaMemeConfig(ControllerConfigBase):
@@ -148,6 +156,7 @@ class SolanaMemeController(ControllerBase):
         # Initialize trade execution publisher
         self.trade_publisher = None
         self.publisher_initialized = False
+        self.using_compression = False
         if TRADE_PUBLISHER_AVAILABLE:
             asyncio.create_task(self._initialize_trade_publisher())
 
@@ -160,13 +169,27 @@ class SolanaMemeController(ControllerBase):
             graphql_endpoint = self.config.graphql_endpoint if hasattr(self.config, "graphql_endpoint") else None
             kafka_bootstrap_servers = self.config.kafka_bootstrap_servers if hasattr(self.config, "kafka_bootstrap_servers") else None
 
-            # Create the publisher
-            self.trade_publisher = await create_trade_execution_publisher(
-                graphql_endpoint=graphql_endpoint,
-                kafka_bootstrap_servers=kafka_bootstrap_servers,
-                kafka_topic="memebot.trading.executions",
-                db_config_key="neon_db"
-            )
+            # Try to use compressed publisher if available
+            if COMPRESSED_PUBLISHER_AVAILABLE:
+                self.logger.info("Using compressed trade execution publisher")
+                self.trade_publisher = await create_compressed_trade_execution_publisher(
+                    graphql_endpoint=graphql_endpoint,
+                    kafka_bootstrap_servers=kafka_bootstrap_servers,
+                    kafka_topic="memebot.trading.executions",
+                    db_config_key="neon_db",
+                    compression_type="trade_execution",
+                    compression_threshold=512  # Compress data larger than 512 bytes
+                )
+                self.using_compression = True
+            else:
+                self.logger.info("Using standard trade execution publisher")
+                # Fall back to non-compressed version
+                self.trade_publisher = await create_trade_execution_publisher(
+                    graphql_endpoint=graphql_endpoint,
+                    kafka_bootstrap_servers=kafka_bootstrap_servers,
+                    kafka_topic="memebot.trading.executions",
+                    db_config_key="neon_db"
+                )
 
             self.publisher_initialized = True
             self.logger.info("Trade execution publisher initialized")
@@ -341,11 +364,22 @@ class SolanaMemeController(ControllerBase):
             return
 
         try:
-            await self.trade_publisher.publish_execution(execution_data)
-            self.logger.info(
-                f"Published {execution_data['action']} execution for {execution_data['token_symbol']} "
-                f"({execution_data['quantity']} @ {execution_data['price']})"
-            )
+            # Publish execution and get results
+            results = await self.trade_publisher.publish_execution(execution_data)
+
+            # Log with compression info if available
+            if self.using_compression and "compression_ratio" in results:
+                compression_ratio = results["compression_ratio"] * 100
+                self.logger.info(
+                    f"Published {execution_data['action']} execution for {execution_data.get('token_symbol', 'unknown')} "
+                    f"({execution_data['quantity']} @ {execution_data['price']}) "
+                    f"[Compressed: {compression_ratio:.1f}%]"
+                )
+            else:
+                self.logger.info(
+                    f"Published {execution_data['action']} execution for {execution_data.get('token_symbol', 'unknown')} "
+                    f"({execution_data['quantity']} @ {execution_data['price']})"
+                )
         except Exception as e:
             self.logger.error(f"Failed to publish trade execution: {str(e)}")
 
